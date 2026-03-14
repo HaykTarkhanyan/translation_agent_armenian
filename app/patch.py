@@ -7,6 +7,7 @@ from typing import Optional, Union
 import gradio as gr
 import openai
 import translation_agent.utils as utils
+from translation_agent.utils import _update_cost
 
 
 RPM = 60
@@ -49,6 +50,11 @@ def model_load(
             )
         case "CUSTOM":
             client = openai.OpenAI(api_key=api_key, base_url=base_url)
+        case "Gemini":
+            client = openai.OpenAI(
+                api_key=api_key if api_key else os.getenv("GEMINI_API_KEY"),
+                base_url="https://generativelanguage.googleapis.com/v1beta/openai/",
+            )
         case "Ollama":
             client = openai.OpenAI(
                 api_key="ollama", base_url="http://localhost:11434/v1"
@@ -128,6 +134,7 @@ def get_completion(
                     {"role": "user", "content": prompt},
                 ],
             )
+            _update_cost(response)
             return response.choices[0].message.content
         except Exception as e:
             raise gr.Error(f"An unexpected error occurred: {e}") from e
@@ -142,6 +149,7 @@ def get_completion(
                     {"role": "user", "content": prompt},
                 ],
             )
+            _update_cost(response)
             return response.choices[0].message.content
         except Exception as e:
             raise gr.Error(f"An unexpected error occurred: {e}") from e

@@ -7,32 +7,85 @@ from dotenv import load_dotenv
 from icecream import ic
 from langchain_text_splitters import RecursiveCharacterTextSplitter
 
+from translation_agent.glossary import format_glossary_for_prompt
+
 
 load_dotenv()  # read local .env file
-client = openai.OpenAI(api_key=os.getenv("OPENAI_API_KEY"))
+
+_client = None
+
+
+def _get_client():
+    global _client
+    if _client is None:
+        _client = openai.OpenAI(
+            api_key=os.getenv("GEMINI_API_KEY"),
+            base_url="https://generativelanguage.googleapis.com/v1beta/openai/",
+        )
+    return _client
 
 MAX_TOKENS_PER_CHUNK = (
     1000  # if text is more than this many tokens, we'll break it up into
 )
 # discrete chunks to translate one chunk at a time
 
+# Cost tracking
+# Gemini 3 Pro pricing (USD per 1M tokens) — update if pricing changes
+COST_PER_1M_INPUT_TOKENS = 1.25
+COST_PER_1M_OUTPUT_TOKENS = 10.00
+
+_cost_tracker = {
+    "prompt_tokens": 0,
+    "completion_tokens": 0,
+    "total_cost": 0.0,
+    "requests": 0,
+}
+
+
+def get_translation_cost():
+    """Return the accumulated cost info for the current translation."""
+    return dict(_cost_tracker)
+
+
+def reset_translation_cost():
+    """Reset the cost tracker."""
+    _cost_tracker["prompt_tokens"] = 0
+    _cost_tracker["completion_tokens"] = 0
+    _cost_tracker["total_cost"] = 0.0
+    _cost_tracker["requests"] = 0
+
+
+def _update_cost(response):
+    """Update cost tracker from an API response's usage field."""
+    usage = getattr(response, "usage", None)
+    if usage:
+        prompt_tokens = usage.prompt_tokens or 0
+        completion_tokens = usage.completion_tokens or 0
+        _cost_tracker["prompt_tokens"] += prompt_tokens
+        _cost_tracker["completion_tokens"] += completion_tokens
+        _cost_tracker["total_cost"] += (
+            prompt_tokens * COST_PER_1M_INPUT_TOKENS / 1_000_000
+            + completion_tokens * COST_PER_1M_OUTPUT_TOKENS / 1_000_000
+        )
+        _cost_tracker["requests"] += 1
+
 
 def get_completion(
     prompt: str,
     system_message: str = "You are a helpful assistant.",
-    model: str = "gpt-4-turbo",
+    model: str = "gemini-3-pro",
     temperature: float = 0.3,
     json_mode: bool = False,
 ) -> Union[str, dict]:
     """
-        Generate a completion using the OpenAI API.
+        Generate a completion using the Gemini API (OpenAI-compatible).
 
     Args:
         prompt (str): The user's prompt or query.
         system_message (str, optional): The system message to set the context for the assistant.
             Defaults to "You are a helpful assistant.".
-        model (str, optional): The name of the OpenAI model to use for generating the completion.
-            Defaults to "gpt-4-turbo".
+        model (str, optional): The name of the model to use for generating the completion.
+            Defaults to "gemini-3-pro".
         temperature (float, optional): The sampling temperature for controlling the randomness of the generated text.
             Defaults to 0.3.
         json_mode (bool, optional): Whether to return the response in JSON format.
@@ -45,7 +98,7 @@ def get_completion(
     """
 
     if json_mode:
-        response = client.chat.completions.create(
+        response = _get_client().chat.completions.create(
             model=model,
             temperature=temperature,
             top_p=1,
@@ -55,9 +108,10 @@ def get_completion(
                 {"role": "user", "content": prompt},
             ],
         )
+        _update_cost(response)
         return response.choices[0].message.content
     else:
-        response = client.chat.completions.create(
+        response = _get_client().chat.completions.create(
             model=model,
             temperature=temperature,
             top_p=1,
@@ -66,11 +120,12 @@ def get_completion(
                 {"role": "user", "content": prompt},
             ],
         )
+        _update_cost(response)
         return response.choices[0].message.content
 
 
 def one_chunk_initial_translation(
-    source_lang: str, target_lang: str, source_text: str
+    source_lang: str, target_lang: str, source_text: str, glossary: str = ""
 ) -> str:
     """
     Translate the entire text as one chunk using an LLM.
@@ -79,6 +134,7 @@ def one_chunk_initial_translation(
         source_lang (str): The source language of the text.
         target_lang (str): The target language for translation.
         source_text (str): The text to be translated.
+        glossary (str): Optional glossary to guide terminology.
 
     Returns:
         str: The translated text.
@@ -86,8 +142,11 @@ def one_chunk_initial_translation(
 
     system_message = f"You are an expert linguist, specializing in translation from {source_lang} to {target_lang}."
 
+    glossary_section = f"\n\n{glossary}\n" if glossary else ""
+
     translation_prompt = f"""This is an {source_lang} to {target_lang} translation, please provide the {target_lang} translation for this text. \
 Do not provide any explanations or text apart from the translation.
+{glossary_section}
 {source_lang}: {source_text}
 
 {target_lang}:"""
@@ -103,6 +162,7 @@ def one_chunk_reflect_on_translation(
     source_text: str,
     translation_1: str,
     country: str = "",
+    glossary: str = "",
 ) -> str:
     """
     Use an LLM to reflect on the translation, treating the entire text as one chunk.
@@ -113,6 +173,7 @@ def one_chunk_reflect_on_translation(
         source_text (str): The original text in the source language.
         translation_1 (str): The initial translation of the source text.
         country (str): Country specified for the target language.
+        glossary (str): Optional glossary to guide terminology.
 
     Returns:
         str: The LLM's reflection on the translation, providing constructive criticism and suggestions for improvement.
@@ -120,6 +181,8 @@ def one_chunk_reflect_on_translation(
 
     system_message = f"You are an expert linguist specializing in translation from {source_lang} to {target_lang}. \
 You will be provided with a source text and its translation and your goal is to improve the translation."
+
+    glossary_section = f"\n\n{glossary}\n" if glossary else ""
 
     if country != "":
         reflection_prompt = f"""Your task is to carefully read a source text and a translation from {source_lang} to {target_lang}, and then give constructive criticism and helpful suggestions to improve the translation. \
@@ -134,7 +197,7 @@ The source text and initial translation, delimited by XML tags <SOURCE_TEXT></SO
 <TRANSLATION>
 {translation_1}
 </TRANSLATION>
-
+{glossary_section}
 When writing suggestions, pay attention to whether there are ways to improve the translation's \n\
 (i) accuracy (by correcting errors of addition, mistranslation, omission, or untranslated text),\n\
 (ii) fluency (by applying {target_lang} grammar, spelling and punctuation rules, and ensuring there are no unnecessary repetitions),\n\
@@ -157,7 +220,7 @@ The source text and initial translation, delimited by XML tags <SOURCE_TEXT></SO
 <TRANSLATION>
 {translation_1}
 </TRANSLATION>
-
+{glossary_section}
 When writing suggestions, pay attention to whether there are ways to improve the translation's \n\
 (i) accuracy (by correcting errors of addition, mistranslation, omission, or untranslated text),\n\
 (ii) fluency (by applying {target_lang} grammar, spelling and punctuation rules, and ensuring there are no unnecessary repetitions),\n\
@@ -178,6 +241,7 @@ def one_chunk_improve_translation(
     source_text: str,
     translation_1: str,
     reflection: str,
+    glossary: str = "",
 ) -> str:
     """
     Use the reflection to improve the translation, treating the entire text as one chunk.
@@ -188,12 +252,15 @@ def one_chunk_improve_translation(
         source_text (str): The original text in the source language.
         translation_1 (str): The initial translation of the source text.
         reflection (str): Expert suggestions and constructive criticism for improving the translation.
+        glossary (str): Optional glossary to guide terminology.
 
     Returns:
         str: The improved translation based on the expert suggestions.
     """
 
     system_message = f"You are an expert linguist, specializing in translation editing from {source_lang} to {target_lang}."
+
+    glossary_section = f"\n\n{glossary}\n" if glossary else ""
 
     prompt = f"""Your task is to carefully read, then edit, a translation from {source_lang} to {target_lang}, taking into
 account a list of expert suggestions and constructive criticisms.
@@ -212,7 +279,7 @@ as follows:
 <EXPERT_SUGGESTIONS>
 {reflection}
 </EXPERT_SUGGESTIONS>
-
+{glossary_section}
 Please take into account the expert suggestions when editing the translation. Edit the translation by ensuring:
 
 (i) accuracy (by correcting errors of addition, mistranslation, omission, or untranslated text),
@@ -229,7 +296,11 @@ Output only the new translation and nothing else."""
 
 
 def one_chunk_translate_text(
-    source_lang: str, target_lang: str, source_text: str, country: str = ""
+    source_lang: str,
+    target_lang: str,
+    source_text: str,
+    country: str = "",
+    glossary: str = "",
 ) -> str:
     """
     Translate a single chunk of text from the source language to the target language.
@@ -243,18 +314,19 @@ def one_chunk_translate_text(
         target_lang (str): The target language for the translation.
         source_text (str): The text to be translated.
         country (str): Country specified for the target language.
+        glossary (str): Optional glossary to guide terminology.
     Returns:
         str: The improved translation of the source text.
     """
     translation_1 = one_chunk_initial_translation(
-        source_lang, target_lang, source_text
+        source_lang, target_lang, source_text, glossary
     )
 
     reflection = one_chunk_reflect_on_translation(
-        source_lang, target_lang, source_text, translation_1, country
+        source_lang, target_lang, source_text, translation_1, country, glossary
     )
     translation_2 = one_chunk_improve_translation(
-        source_lang, target_lang, source_text, translation_1, reflection
+        source_lang, target_lang, source_text, translation_1, reflection, glossary
     )
 
     return translation_2
@@ -286,7 +358,10 @@ def num_tokens_in_string(
 
 
 def multichunk_initial_translation(
-    source_lang: str, target_lang: str, source_text_chunks: List[str]
+    source_lang: str,
+    target_lang: str,
+    source_text_chunks: List[str],
+    glossary: str = "",
 ) -> List[str]:
     """
     Translate a text in multiple chunks from the source language to the target language.
@@ -295,12 +370,15 @@ def multichunk_initial_translation(
         source_lang (str): The source language of the text.
         target_lang (str): The target language for translation.
         source_text_chunks (List[str]): A list of text chunks to be translated.
+        glossary (str): Optional glossary to guide terminology.
 
     Returns:
         List[str]: A list of translated text chunks.
     """
 
     system_message = f"You are an expert linguist, specializing in translation from {source_lang} to {target_lang}."
+
+    glossary_section = f"\n\n{glossary}\n" if glossary else ""
 
     translation_prompt = """Your task is to provide a professional translation from {source_lang} to {target_lang} of PART of a text.
 
@@ -316,7 +394,7 @@ To reiterate, you should translate only this part of the text, shown here again 
 <TRANSLATE_THIS>
 {chunk_to_translate}
 </TRANSLATE_THIS>
-
+{glossary_section}
 Output only the translation of the portion you are asked to translate, and nothing else.
 """
 
@@ -336,6 +414,7 @@ Output only the translation of the portion you are asked to translate, and nothi
             target_lang=target_lang,
             tagged_text=tagged_text,
             chunk_to_translate=source_text_chunks[i],
+            glossary_section=glossary_section,
         )
 
         translation = get_completion(prompt, system_message=system_message)
@@ -350,6 +429,7 @@ def multichunk_reflect_on_translation(
     source_text_chunks: List[str],
     translation_1_chunks: List[str],
     country: str = "",
+    glossary: str = "",
 ) -> List[str]:
     """
     Provides constructive criticism and suggestions for improving a partial translation.
@@ -360,6 +440,7 @@ def multichunk_reflect_on_translation(
         source_text_chunks (List[str]): The source text divided into chunks.
         translation_1_chunks (List[str]): The translated chunks corresponding to the source text chunks.
         country (str): Country specified for the target language.
+        glossary (str): Optional glossary to guide terminology.
 
     Returns:
         List[str]: A list of reflections containing suggestions for improving each translated chunk.
@@ -367,6 +448,8 @@ def multichunk_reflect_on_translation(
 
     system_message = f"You are an expert linguist specializing in translation from {source_lang} to {target_lang}. \
 You will be provided with a source text and its translation and your goal is to improve the translation."
+
+    glossary_section = f"\n\n{glossary}\n" if glossary else ""
 
     if country != "":
         reflection_prompt = """Your task is to carefully read a source text and part of a translation of that text from {source_lang} to {target_lang}, and then give constructive criticism and helpful suggestions for improving the translation.
@@ -389,7 +472,7 @@ The translation of the indicated part, delimited below by <TRANSLATION> and </TR
 <TRANSLATION>
 {translation_1_chunk}
 </TRANSLATION>
-
+{glossary_section}
 When writing suggestions, pay attention to whether there are ways to improve the translation's:\n\
 (i) accuracy (by correcting errors of addition, mistranslation, omission, or untranslated text),\n\
 (ii) fluency (by applying {target_lang} grammar, spelling and punctuation rules, and ensuring there are no unnecessary repetitions),\n\
@@ -420,7 +503,7 @@ The translation of the indicated part, delimited below by <TRANSLATION> and </TR
 <TRANSLATION>
 {translation_1_chunk}
 </TRANSLATION>
-
+{glossary_section}
 When writing suggestions, pay attention to whether there are ways to improve the translation's:\n\
 (i) accuracy (by correcting errors of addition, mistranslation, omission, or untranslated text),\n\
 (ii) fluency (by applying {target_lang} grammar, spelling and punctuation rules, and ensuring there are no unnecessary repetitions),\n\
@@ -449,6 +532,7 @@ Output only the suggestions and nothing else."""
                 chunk_to_translate=source_text_chunks[i],
                 translation_1_chunk=translation_1_chunks[i],
                 country=country,
+                glossary_section=glossary_section,
             )
         else:
             prompt = reflection_prompt.format(
@@ -457,6 +541,7 @@ Output only the suggestions and nothing else."""
                 tagged_text=tagged_text,
                 chunk_to_translate=source_text_chunks[i],
                 translation_1_chunk=translation_1_chunks[i],
+                glossary_section=glossary_section,
             )
 
         reflection = get_completion(prompt, system_message=system_message)
@@ -471,6 +556,7 @@ def multichunk_improve_translation(
     source_text_chunks: List[str],
     translation_1_chunks: List[str],
     reflection_chunks: List[str],
+    glossary: str = "",
 ) -> List[str]:
     """
     Improves the translation of a text from source language to target language by considering expert suggestions.
@@ -481,12 +567,15 @@ def multichunk_improve_translation(
         source_text_chunks (List[str]): The source text divided into chunks.
         translation_1_chunks (List[str]): The initial translation of each chunk.
         reflection_chunks (List[str]): Expert suggestions for improving each translated chunk.
+        glossary (str): Optional glossary to guide terminology.
 
     Returns:
         List[str]: The improved translation of each chunk.
     """
 
     system_message = f"You are an expert linguist, specializing in translation editing from {source_lang} to {target_lang}."
+
+    glossary_section = f"\n\n{glossary}\n" if glossary else ""
 
     improvement_prompt = """Your task is to carefully read, then improve, a translation from {source_lang} to {target_lang}, taking into
 account a set of expert suggestions and constructive criticisms. Below, the source text, initial translation, and expert suggestions are provided.
@@ -513,7 +602,7 @@ The expert translations of the indicated part, delimited below by <EXPERT_SUGGES
 <EXPERT_SUGGESTIONS>
 {reflection_chunk}
 </EXPERT_SUGGESTIONS>
-
+{glossary_section}
 Taking into account the expert suggestions rewrite the translation to improve it, paying attention
 to whether there are ways to improve the translation's
 
@@ -543,6 +632,7 @@ Output only the new translation of the indicated part and nothing else."""
             chunk_to_translate=source_text_chunks[i],
             translation_1_chunk=translation_1_chunks[i],
             reflection_chunk=reflection_chunks[i],
+            glossary_section=glossary_section,
         )
 
         translation_2 = get_completion(prompt, system_message=system_message)
@@ -552,7 +642,11 @@ Output only the new translation of the indicated part and nothing else."""
 
 
 def multichunk_translation(
-    source_lang, target_lang, source_text_chunks, country: str = ""
+    source_lang,
+    target_lang,
+    source_text_chunks,
+    country: str = "",
+    glossary: str = "",
 ):
     """
     Improves the translation of multiple text chunks based on the initial translation and reflection.
@@ -561,15 +655,14 @@ def multichunk_translation(
         source_lang (str): The source language of the text chunks.
         target_lang (str): The target language for translation.
         source_text_chunks (List[str]): The list of source text chunks to be translated.
-        translation_1_chunks (List[str]): The list of initial translations for each source text chunk.
-        reflection_chunks (List[str]): The list of reflections on the initial translations.
         country (str): Country specified for the target language
+        glossary (str): Optional glossary to guide terminology.
     Returns:
         List[str]: The list of improved translations for each source text chunk.
     """
 
     translation_1_chunks = multichunk_initial_translation(
-        source_lang, target_lang, source_text_chunks
+        source_lang, target_lang, source_text_chunks, glossary
     )
 
     reflection_chunks = multichunk_reflect_on_translation(
@@ -578,6 +671,7 @@ def multichunk_translation(
         source_text_chunks,
         translation_1_chunks,
         country,
+        glossary,
     )
 
     translation_2_chunks = multichunk_improve_translation(
@@ -586,6 +680,7 @@ def multichunk_translation(
         source_text_chunks,
         translation_1_chunks,
         reflection_chunks,
+        glossary,
     )
 
     return translation_2_chunks
@@ -633,13 +728,19 @@ def calculate_chunk_size(token_count: int, token_limit: int) -> int:
 
 
 def translate(
-    source_lang,
-    target_lang,
-    source_text,
-    country,
+    source_lang="English",
+    target_lang="Armenian",
+    source_text="",
+    country="Armenia",
     max_tokens=MAX_TOKENS_PER_CHUNK,
+    glossary="",
 ):
     """Translate the source_text from source_lang to target_lang."""
+
+    reset_translation_cost()
+
+    if not glossary:
+        glossary = format_glossary_for_prompt()
 
     num_tokens_in_text = num_tokens_in_string(source_text)
 
@@ -649,7 +750,15 @@ def translate(
         ic("Translating text as a single chunk")
 
         final_translation = one_chunk_translate_text(
-            source_lang, target_lang, source_text, country
+            source_lang, target_lang, source_text, country, glossary
+        )
+
+        cost = get_translation_cost()
+        print(
+            f"\nAPI Cost: ${cost['total_cost']:.6f} "
+            f"({cost['prompt_tokens']} input tokens, "
+            f"{cost['completion_tokens']} output tokens, "
+            f"{cost['requests']} requests)"
         )
 
         return final_translation
@@ -663,6 +772,7 @@ def translate(
 
         ic(token_size)
 
+        # Using GPT-4 tokenizer as approximation for chunk splitting
         text_splitter = RecursiveCharacterTextSplitter.from_tiktoken_encoder(
             model_name="gpt-4",
             chunk_size=token_size,
@@ -672,7 +782,15 @@ def translate(
         source_text_chunks = text_splitter.split_text(source_text)
 
         translation_2_chunks = multichunk_translation(
-            source_lang, target_lang, source_text_chunks, country
+            source_lang, target_lang, source_text_chunks, country, glossary
+        )
+
+        cost = get_translation_cost()
+        print(
+            f"\nAPI Cost: ${cost['total_cost']:.6f} "
+            f"({cost['prompt_tokens']} input tokens, "
+            f"{cost['completion_tokens']} output tokens, "
+            f"{cost['requests']} requests)"
         )
 
         return "".join(translation_2_chunks)
